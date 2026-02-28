@@ -16,7 +16,7 @@
 namespace duckdb {
 
 struct AddConstraintInfo;
-struct PersistentTableData;
+class PersistentTableData;
 
 //! Holds deferred initialization data for lazy DataTable creation
 struct LazyTableData {

@@ -161,8 +161,56 @@ void DuckTableEntry::MaterializeStorage() {
 	                                     StorageManager::Get(catalog).GetTableIOManager(nullptr), schema.name, name,
 	                                     std::move(column_defs), std::move(lazy_data->persistent_data));
 
-	if (!lazy_data->indexes.empty()) {
-		storage->SetIndexStorageInfo(std::move(lazy_data->indexes));
+	// Replicate constraint-based index creation (same logic as the constructor).
+	// info.indexes are consumed in order: one per UNIQUE/PK/FK constraint, remainder to SetIndexStorageInfo.
+	auto &indexes = lazy_data->indexes;
+	idx_t indexes_idx = 0;
+	for (idx_t i = 0; i < constraints.size(); i++) {
+		auto &constraint = constraints[i];
+		if (constraint->type == ConstraintType::UNIQUE) {
+			auto &unique = constraint->Cast<UniqueConstraint>();
+			IndexConstraintType constraint_type = IndexConstraintType::UNIQUE;
+			if (unique.is_primary_key) {
+				constraint_type = IndexConstraintType::PRIMARY;
+			}
+			auto column_indexes = unique.GetLogicalIndexes(columns);
+			if (indexes.empty()) {
+				break;
+			}
+			auto index_storage_info = std::move(indexes[indexes_idx++]);
+			if (index_storage_info.name.empty()) {
+				index_storage_info.name = EnumUtil::ToString(constraint_type) + "_" + name + "_" + to_string(i);
+			}
+			storage->AddIndex(columns, column_indexes, constraint_type, std::move(index_storage_info));
+		} else if (constraint->type == ConstraintType::FOREIGN_KEY) {
+			auto &bfk = constraint->Cast<ForeignKeyConstraint>();
+			if (bfk.info.type == ForeignKeyType::FK_TYPE_FOREIGN_KEY_TABLE ||
+			    bfk.info.type == ForeignKeyType::FK_TYPE_SELF_REFERENCE_TABLE) {
+				vector<LogicalIndex> column_indexes;
+				for (const auto &physical_index : bfk.info.fk_keys) {
+					auto &col = columns.GetColumn(physical_index);
+					column_indexes.push_back(col.Logical());
+				}
+				if (indexes.empty()) {
+					break;
+				}
+				auto index_storage_info = std::move(indexes[indexes_idx++]);
+				if (index_storage_info.name.empty()) {
+					index_storage_info.name =
+					    EnumUtil::ToString(IndexConstraintType::FOREIGN) + "_" + name + "_" + to_string(i);
+				}
+				storage->AddIndex(columns, column_indexes, IndexConstraintType::FOREIGN, std::move(index_storage_info));
+			}
+		}
+	}
+
+	// Move any remaining unused IndexStorageInfos to storage (for standalone indexes).
+	vector<IndexStorageInfo> remaining_indexes;
+	while (indexes_idx < indexes.size()) {
+		remaining_indexes.push_back(std::move(indexes[indexes_idx++]));
+	}
+	if (!remaining_indexes.empty()) {
+		storage->SetIndexStorageInfo(std::move(remaining_indexes));
 	}
 	lazy_data.reset();
 }
@@ -205,12 +253,22 @@ unique_ptr<CatalogEntry> DuckTableEntry::AlterEntry(CatalogTransaction transacti
 		return CatalogEntry::AlterEntry(transaction, info);
 	}
 
+	// Ensure storage is materialized before FK constraint modification
+	if (!storage && lazy_data) {
+		MaterializeStorage();
+	}
+
 	// We add foreign key constraints without a client context during checkpoint loading.
 	return AddForeignKeyConstraint(foreign_key_constraint_info);
 }
 
 unique_ptr<CatalogEntry> DuckTableEntry::AlterEntry(ClientContext &context, AlterInfo &info) {
 	D_ASSERT(!internal);
+
+	// Ensure storage is materialized before any ALTER operation
+	if (!storage && lazy_data) {
+		MaterializeStorage();
+	}
 
 	// Column comments have a special alter type
 	if (info.type == AlterType::SET_COLUMN_COMMENT) {
