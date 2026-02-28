@@ -11,10 +11,18 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/planner/constraints/bound_unique_constraint.hpp"
+#include "duckdb/storage/index_storage_info.hpp"
 
 namespace duckdb {
 
 struct AddConstraintInfo;
+struct PersistentTableData;
+
+//! Holds deferred initialization data for lazy DataTable creation
+struct LazyTableData {
+	unique_ptr<PersistentTableData> persistent_data;
+	vector<IndexStorageInfo> indexes;
+};
 
 //! A table catalog entry
 class DuckTableEntry : public TableCatalogEntry {
@@ -76,10 +84,17 @@ private:
 	                                   const RemoveColumnInfo &info, CreateTableInfo &create_info,
 	                                   const vector<unique_ptr<BoundConstraint>> &bound_constraints, bool is_generated);
 
+	//! Materialize the DataTable from lazy_data (thread-safe, called on first access)
+	void MaterializeStorage();
+
 private:
 	//! A reference to the underlying storage unit used for this table
 	shared_ptr<DataTable> storage;
 	//! Manages dependencies of the individual columns of the table
 	ColumnDependencyManager column_dependency_manager;
+	//! Deferred initialization data for lazy DataTable creation (null after materialization)
+	unique_ptr<LazyTableData> lazy_data;
+	//! Mutex protecting lazy materialization of storage
+	mutex lazy_lock;
 };
 } // namespace duckdb

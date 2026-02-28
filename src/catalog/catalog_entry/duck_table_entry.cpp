@@ -51,6 +51,17 @@ DuckTableEntry::DuckTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, Bou
 		return;
 	}
 
+	// If persistent data is available (loading from checkpoint), defer DataTable creation
+	// until the table is first accessed. This avoids allocating DataTable, DataTableInfo,
+	// RowGroupCollection, TableStatistics, ColumnStatistics (with HyperLogLog), and
+	// ReservoirSample for every table at database open time.
+	if (info.data) {
+		lazy_data = make_uniq<LazyTableData>();
+		lazy_data->persistent_data = std::move(info.data);
+		lazy_data->indexes = std::move(info.indexes);
+		return;
+	}
+
 	// create the physical storage
 	vector<ColumnDefinition> column_defs;
 	for (auto &col_def : columns.Physical()) {
@@ -134,8 +145,30 @@ DuckTableEntry::DuckTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, Bou
 	}
 }
 
+void DuckTableEntry::MaterializeStorage() {
+	lock_guard<mutex> guard(lazy_lock);
+	if (storage) {
+		return;
+	}
+	D_ASSERT(lazy_data);
+
+	vector<ColumnDefinition> column_defs;
+	for (auto &col_def : columns.Physical()) {
+		column_defs.push_back(col_def.Copy());
+	}
+
+	storage = make_shared_ptr<DataTable>(catalog.GetAttached(),
+	                                     StorageManager::Get(catalog).GetTableIOManager(nullptr), schema.name, name,
+	                                     std::move(column_defs), std::move(lazy_data->persistent_data));
+
+	if (!lazy_data->indexes.empty()) {
+		storage->SetIndexStorageInfo(std::move(lazy_data->indexes));
+	}
+	lazy_data.reset();
+}
+
 unique_ptr<BaseStatistics> DuckTableEntry::GetStatistics(ClientContext &context, const StorageIndex &column_id) {
-	return storage->GetStatistics(context, column_id);
+	return GetStorage().GetStatistics(context, column_id);
 }
 
 unique_ptr<BaseStatistics> DuckTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
@@ -147,11 +180,11 @@ unique_ptr<BaseStatistics> DuckTableEntry::GetStatistics(ClientContext &context,
 		return nullptr;
 	}
 	auto storage_index = GetStorageIndex(ColumnIndex(column_id));
-	return storage->GetStatistics(context, storage_index);
+	return GetStorage().GetStatistics(context, storage_index);
 }
 
 unique_ptr<BlockingSample> DuckTableEntry::GetSample() {
-	return storage->GetSample();
+	return GetStorage().GetSample();
 }
 
 unique_ptr<CatalogEntry> DuckTableEntry::AlterEntry(CatalogTransaction transaction, AlterInfo &info) {
@@ -202,7 +235,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::AlterEntry(ClientContext &context, Alte
 		auto &rename_info = table_info.Cast<RenameTableInfo>();
 		auto copied_table = Copy(context);
 		copied_table->name = rename_info.new_table_name;
-		storage->SetTableName(rename_info.new_table_name);
+		GetStorage().SetTableName(rename_info.new_table_name);
 		return copied_table;
 	}
 	case AlterTableType::ADD_COLUMN: {
@@ -269,7 +302,7 @@ void DuckTableEntry::UndoAlter(ClientContext &context, AlterInfo &info) {
 	auto &table_info = info.Cast<AlterTableInfo>();
 	switch (table_info.alter_table_type) {
 	case AlterTableType::RENAME_TABLE: {
-		storage->SetTableName(this->name);
+		GetStorage().SetTableName(this->name);
 		break;
 	default:
 		break;
@@ -1204,7 +1237,9 @@ void DuckTableEntry::Rollback(CatalogEntry &prev_entry) {
 }
 
 void DuckTableEntry::OnDrop() {
-	storage->SetAsDropped();
+	if (storage) {
+		storage->SetAsDropped();
+	}
 }
 
 unique_ptr<CatalogEntry> DuckTableEntry::AddConstraint(ClientContext &context, AddConstraintInfo &info) {
@@ -1237,6 +1272,9 @@ unique_ptr<CatalogEntry> DuckTableEntry::AddConstraint(ClientContext &context, A
 
 unique_ptr<CatalogEntry> DuckTableEntry::Copy(ClientContext &context) const {
 	D_ASSERT(!internal);
+	if (!storage) {
+		const_cast<DuckTableEntry *>(this)->MaterializeStorage();
+	}
 	auto create_info = GetInfo();
 
 	auto binder = Binder::CreateBinder(context);
@@ -1245,6 +1283,9 @@ unique_ptr<CatalogEntry> DuckTableEntry::Copy(ClientContext &context) const {
 }
 
 void DuckTableEntry::SetAsRoot() {
+	if (!storage) {
+		MaterializeStorage();
+	}
 	storage->SetAsMainTable();
 	storage->SetTableName(name);
 }
@@ -1265,14 +1306,19 @@ void DuckTableEntry::CommitAlter(string &column_name) {
 
 	auto logical_column_index = LogicalIndex(removed_index.GetIndex());
 	auto column_index = columns.LogicalToPhysical(logical_column_index).index;
-	storage->CommitDropColumn(column_index);
+	GetStorage().CommitDropColumn(column_index);
 }
 
 void DuckTableEntry::CommitDrop() {
-	storage->CommitDropTable();
+	if (storage) {
+		storage->CommitDropTable();
+	}
 }
 
 DataTable &DuckTableEntry::GetStorage() {
+	if (!storage) {
+		MaterializeStorage();
+	}
 	return *storage;
 }
 
@@ -1282,11 +1328,11 @@ TableFunction DuckTableEntry::GetScanFunction(ClientContext &context, unique_ptr
 }
 
 vector<ColumnSegmentInfo> DuckTableEntry::GetColumnSegmentInfo(const QueryContext &context) {
-	return storage->GetColumnSegmentInfo(context);
+	return GetStorage().GetColumnSegmentInfo(context);
 }
 
 TableStorageInfo DuckTableEntry::GetStorageInfo(ClientContext &context) {
-	return storage->GetStorageInfo();
+	return GetStorage().GetStorageInfo();
 }
 
 } // namespace duckdb
